@@ -22,28 +22,30 @@ Mở `http://127.0.0.1:5000`. Khách truy cập trang chủ trực tiếp. Admin
 
 Cài các gói trong `requirements.txt`, đặt `FLASK_SECRET_KEY`, `ADMIN_USERNAME` và một `ADMIN_PASSWORD` riêng, rồi chạy `gunicorn --bind 0.0.0.0:$PORT app:app`. Với máy chủ có ổ đĩa bền vững, ứng dụng có thể dùng `LAB_DATABASE` và `LAB_UPLOADS` cục bộ. Không dùng hai thư mục này trên môi trường serverless.
 
-## Triển khai miễn phí thử nghiệm: Vercel + Supabase + Cloudflare R2
+## Triển khai miễn phí thử nghiệm: Vercel + Supabase
 
-Mô hình này dùng Vercel cho ứng dụng Flask, Supabase PostgreSQL cho dữ liệu mượn/trả và Cloudflare R2 cho ảnh gốc. Ảnh gốc nằm trong bucket riêng; trang chỉ trả về ảnh đã đóng dấu qua ứng dụng.
+Mô hình này dùng Vercel cho ứng dụng Flask và một dự án Supabase cho cả PostgreSQL lẫn Supabase Storage. Ảnh gốc nằm trong bucket `lab-files` ở chế độ private; trang chỉ trả về ảnh đã đóng dấu qua ứng dụng.
 
-1. Tạo dự án PostgreSQL trên Supabase. Trong **Connect**, lấy chuỗi **Shared pooler / Transaction mode**, thêm `?sslmode=require` nếu chuỗi chưa có tham số này. Tạo dự án lần đầu chưa cần tạo bảng: ứng dụng tự khởi tạo bảng và tài khoản admin khi chạy.
-2. Tại Cloudflare R2, tạo bucket riêng, ví dụ `lab-equipment-files`. Tạo API token chỉ có quyền **Object Read & Write** cho đúng bucket đó. Lưu `Account ID`, endpoint S3, Access Key ID và Secret Access Key ở nơi an toàn; không đưa chúng vào GitHub.
-3. Trên Vercel, nhập repository GitHub `danghoangsqtt-sys/web-manager-lab`. Vercel tự nhận diện Flask/Python. Trong **Settings → Environment Variables**, đặt:
+1. Tạo một project Supabase, đặt mật khẩu cơ sở dữ liệu mạnh và chờ project hoạt động.
+2. Mở **SQL Editor → New query**, sao chép toàn bộ nội dung `supabase_setup.sql`, dán vào và chọn **Run**. Lệnh này tạo bảng `users`, `items`, `loans`, các index và bucket private `lab-files` chỉ nhận ảnh tối đa 4 MB.
+3. Mở **Connect**, chọn **Shared pooler / Transaction mode**, sao chép chuỗi kết nối và thêm `?sslmode=require` nếu chuỗi chưa có tham số này. Dùng chuỗi này cho `DATABASE_URL`.
+4. Mở **Project Settings → API** để lấy `SUPABASE_URL` và service-role key. Chỉ dùng service-role key trong Vercel; không đưa khóa này vào trình duyệt, GitHub hoặc tệp `.env` đã công khai.
+5. Trên Vercel, nhập repository GitHub `danghoangsqtt-sys/web-manager-lab`. Vercel tự nhận diện Flask/Python. Trong **Settings → Environment Variables**, đặt:
    - `DATABASE_URL`: chuỗi Shared pooler của Supabase.
-   - `R2_BUCKET`, `R2_ENDPOINT_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`: thông tin R2.
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_STORAGE_BUCKET=lab-files`.
    - `FLASK_SECRET_KEY`: một chuỗi ngẫu nhiên dài, cố định.
    - `ADMIN_USERNAME` và `ADMIN_PASSWORD`: thông tin admin mới, không dùng mật khẩu mẫu.
-4. Chọn **Deploy**. Ở lần truy cập đầu, ứng dụng tạo bảng và admin. Đăng nhập `/login`, sau đó thêm thiết bị và ảnh. Dữ liệu cục bộ cũ không tự được đưa lên; với cơ sở dữ liệu sạch hiện tại chỉ cần thêm dữ liệu thật trên website.
+6. Chọn **Deploy**. Ở lần truy cập đầu, ứng dụng tự tạo admin nếu chưa có. Đăng nhập `/login`, sau đó thêm thiết bị và ảnh. Dữ liệu cục bộ cũ không tự được đưa lên; với cơ sở dữ liệu sạch hiện tại chỉ cần thêm dữ liệu thật trên website.
 
-Vercel giới hạn toàn bộ request/response của Function ở 4,5 MB, nên biểu mẫu giới hạn ảnh ở 4 MB. Muốn lưu ảnh lớn hơn cần bổ sung luồng tải thẳng lên R2 bằng URL tạm thời.
+Vercel giới hạn toàn bộ request/response của Function ở 4,5 MB, nên biểu mẫu và bucket đều giới hạn ảnh ở 4 MB. Muốn lưu ảnh lớn hơn cần bổ sung luồng tải trực tiếp lên Supabase Storage.
 
 ## Dữ liệu
 
 - Khi không đặt `DATABASE_URL`, SQLite mặc định lưu ở `instance/lab.sqlite3`. Khi đặt `DATABASE_URL`, ứng dụng dùng PostgreSQL; đây là chế độ cần dùng trên Vercel.
-- Khi không đặt thông tin R2, ảnh gốc lưu ở `instance/uploads/`. Khi đặt đủ bốn biến `R2_*`, ảnh gốc lưu trong bucket Cloudflare R2 riêng; trang web chỉ gửi bản ảnh đã đóng dấu tên tác giả `Lê Bá Đăng Hoàng`. Hỗ trợ PNG, JPG, WEBP và GIF, tối đa 4 MB.
+- Khi không đặt thông tin Supabase Storage, ảnh gốc lưu ở `instance/uploads/`. Khi đặt `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` và `SUPABASE_STORAGE_BUCKET`, ảnh gốc lưu trong bucket Supabase private; trang web chỉ gửi bản ảnh đã đóng dấu tên tác giả `Lê Bá Đăng Hoàng`. Hỗ trợ PNG, JPG, WEBP và GIF, tối đa 4 MB.
 - Kho được chia theo nhóm tài sản: máy tính, KIT thực hành, board mạch & module, linh kiện điện tử, thiết bị đo, dụng cụ & phụ kiện và nhóm khác. Giá đơn vị là tùy chọn, nhập bằng VNĐ để tính giá trị tồn kho.
 - Báo cáo CSV dùng định dạng phù hợp với Excel, có tiêu đề, ngày xuất, nhóm tài sản, giá trị ước tính, tình trạng mượn/trả và phần tổng hợp cuối báo cáo.
-- Thư mục `instance/`, môi trường Python và tệp `.env` được loại khỏi Git. Sao lưu dữ liệu SQLite và ảnh riêng nếu cần giữ thông tin. Với Supabase/R2, bật các cơ chế sao lưu do nhà cung cấp hỗ trợ và lưu riêng khóa truy cập.
+- Thư mục `instance/`, môi trường Python và tệp `.env` được loại khỏi Git. Sao lưu dữ liệu SQLite và ảnh riêng nếu cần giữ thông tin. Với Supabase, xuất dữ liệu PostgreSQL và sao lưu Storage định kỳ; lưu riêng các khóa truy cập.
 - QR và phiếu mượn có thể xem mà không đăng nhập; khách xem phiếu chỉ thấy trạng thái “Đã ký”, không thấy tên chữ ký. Báo cáo CSV chứa chữ ký chỉ admin được tải.
 
 ## Lưu ý

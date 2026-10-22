@@ -8,13 +8,12 @@ from datetime import date, datetime
 from functools import wraps
 from pathlib import Path
 
-import boto3
 import qrcode
 import psycopg
 from PIL import Image, ImageDraw, ImageFont
-from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, abort, flash, g, make_response, redirect, render_template_string, request, send_file, session, url_for
 from psycopg.rows import dict_row
+from supabase import create_client
 from werkzeug.utils import safe_join, secure_filename
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -23,11 +22,10 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE = Path(os.environ.get("LAB_DATABASE", BASE_DIR / "instance" / "lab.sqlite3"))
 UPLOADS_DIR = Path(os.environ.get("LAB_UPLOADS", BASE_DIR / "instance" / "uploads"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
-R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "").strip()
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
-_r2_client = None
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = os.environ.get("SUPABASE_STORAGE_BUCKET", "lab-files").strip()
+_supabase_client = None
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
@@ -176,37 +174,36 @@ class PostgresConnection:
             self.connection.close()
 
 
-def r2_enabled():
-    return bool(R2_BUCKET)
+class StorageError(Exception):
+    pass
 
 
-def get_r2_client():
-    global _r2_client
-    if not r2_enabled():
+def supabase_storage_enabled():
+    return bool(SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY)
+
+
+def get_supabase_client():
+    global _supabase_client
+    if not supabase_storage_enabled():
         return None
-    if _r2_client is not None:
-        return _r2_client
-    if not all((R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)):
-        raise RuntimeError("Thiếu cấu hình Cloudflare R2.")
-    _r2_client = boto3.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT_URL,
-        aws_access_key_id=R2_ACCESS_KEY_ID,
-        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        region_name="auto",
-    )
-    return _r2_client
+    if not all((SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_BUCKET)):
+        raise StorageError("Thiếu cấu hình Supabase Storage.")
+    if _supabase_client is None:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return _supabase_client
 
 
 def save_image(filename, upload, content_type):
     upload.stream.seek(0)
-    if r2_enabled():
-        get_r2_client().put_object(
-            Bucket=R2_BUCKET,
-            Key=f"uploads/{filename}",
-            Body=upload.stream.read(),
-            ContentType=content_type,
-        )
+    if supabase_storage_enabled():
+        try:
+            get_supabase_client().storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+                path=f"uploads/{filename}",
+                file=upload.stream.read(),
+                file_options={"content-type": content_type, "cache-control": "private, max-age=0", "upsert": "false"},
+            )
+        except Exception as error:
+            raise StorageError("Không thể lưu ảnh vào Supabase Storage.") from error
         return
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     upload.save(UPLOADS_DIR / filename)
@@ -215,20 +212,21 @@ def save_image(filename, upload, content_type):
 def delete_image(filename):
     if not filename:
         return
-    if r2_enabled():
-        get_r2_client().delete_object(Bucket=R2_BUCKET, Key=f"uploads/{filename}")
+    if supabase_storage_enabled():
+        try:
+            get_supabase_client().storage.from_(SUPABASE_STORAGE_BUCKET).remove([f"uploads/{filename}"])
+        except Exception as error:
+            raise StorageError("Không thể xóa ảnh trên Supabase Storage.") from error
         return
     (UPLOADS_DIR / filename).unlink(missing_ok=True)
 
 
 def get_image_stream(filename):
-    if r2_enabled():
-        response = get_r2_client().get_object(Bucket=R2_BUCKET, Key=f"uploads/{filename}")
-        body = response["Body"]
+    if supabase_storage_enabled():
         try:
-            return io.BytesIO(body.read())
-        finally:
-            body.close()
+            return io.BytesIO(get_supabase_client().storage.from_(SUPABASE_STORAGE_BUCKET).download(f"uploads/{filename}"))
+        except Exception as error:
+            raise StorageError("Không thể đọc ảnh từ Supabase Storage.") from error
     image_path = safe_join(str(UPLOADS_DIR), filename)
     if not image_path or not Path(image_path).is_file():
         raise FileNotFoundError
@@ -438,12 +436,12 @@ def add_item():
                         request.form.get("location", "").strip(), quantity, minimum,
                         unit_price, request.form.get("notes", "").strip(), image_path))
         flash("Đã thêm mặt hàng vào kho.")
-    except (ValueError, OSError, RuntimeError, BotoCoreError, ClientError, sqlite3.IntegrityError,
+    except (ValueError, OSError, StorageError, sqlite3.IntegrityError,
             psycopg.IntegrityError, Image.DecompressionBombError):
         if image_path:
             try:
                 delete_image(image_path)
-            except (OSError, BotoCoreError, ClientError, RuntimeError):
+            except (OSError, StorageError):
                 pass
         flash("Không thể thêm: kiểm tra số liệu, giá tiền, mã trùng hoặc định dạng ảnh.")
     return redirect(url_for("index"))
@@ -588,7 +586,7 @@ def uploaded_image(filename):
             image.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
         output = io.BytesIO()
         image.save(output, format="WEBP", quality=85, method=6)
-    except (FileNotFoundError, OSError, BotoCoreError, ClientError, RuntimeError, Image.DecompressionBombError):
+    except (FileNotFoundError, OSError, StorageError, Image.DecompressionBombError):
         abort(404)
     output.seek(0)
     response = send_file(output, mimetype="image/webp", max_age=0)
