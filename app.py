@@ -3,20 +3,25 @@ import io
 import os
 import secrets
 import sqlite3
+import uuid
 from datetime import date, datetime
 from functools import wraps
 from pathlib import Path
 
 import qrcode
-from flask import Flask, abort, flash, g, make_response, redirect, render_template_string, request, send_file, session, url_for
+from PIL import Image
+from flask import Flask, abort, flash, g, make_response, redirect, render_template_string, request, send_file, send_from_directory, session, url_for
+from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = Path(os.environ.get("LAB_DATABASE", BASE_DIR / "instance" / "lab.sqlite3"))
+UPLOADS_DIR = Path(os.environ.get("LAB_UPLOADS", BASE_DIR / "instance" / "uploads"))
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+ALLOWED_IMAGE_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "GIF": ".gif"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -36,12 +41,14 @@ CREATE TABLE IF NOT EXISTS items (
     quantity INTEGER NOT NULL DEFAULT 1 CHECK(quantity >= 0),
     minimum_stock INTEGER NOT NULL DEFAULT 0 CHECK(minimum_stock >= 0),
     notes TEXT NOT NULL DEFAULT '',
+    image_path TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS loans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item_id INTEGER NOT NULL REFERENCES items(id),
     borrower_id INTEGER NOT NULL REFERENCES users(id),
+    borrower_name TEXT NOT NULL DEFAULT '',
     quantity INTEGER NOT NULL CHECK(quantity > 0),
     purpose TEXT NOT NULL,
     borrowed_at TEXT NOT NULL,
@@ -57,16 +64,16 @@ CREATE TABLE IF NOT EXISTS loans (
 
 PAGE = """<!doctype html>
 <html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ title }} · Quản lý Phòng thí nghiệm Điện tử số</title>
+<title>{{ title }} · Lab</title>
 <style>
-:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#172033;background:#f3f6fb}*{box-sizing:border-box}body{margin:0}header{background:#102d55;color:white;padding:16px max(20px,calc((100% - 1180px)/2));display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap}header a{color:#dceaff;text-decoration:none;margin-right:14px}main{max-width:1180px;margin:28px auto;padding:0 18px}.brand{font-weight:750;font-size:18px}h1{font-size:26px;margin:0 0 16px}.muted{color:#65728a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin:18px 0}.card,section{background:white;border:1px solid #e1e7f0;border-radius:12px;padding:18px;margin:14px 0;box-shadow:0 3px 12px #243c5a0a}.metric{font-size:28px;font-weight:750;color:#154f91}input,select,textarea,button{font:inherit;padding:9px 11px;border:1px solid #cad4e2;border-radius:7px;max-width:100%}input,select,textarea{width:100%;margin:4px 0 10px}button,.button{background:#1459a3;color:white;border:0;cursor:pointer;text-decoration:none;display:inline-block;padding:9px 13px;border-radius:7px}button:hover,.button:hover{background:#0e447e}label{font-size:13px;font-weight:650;display:block}form.inline{display:inline}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;border-bottom:1px solid #e8edf3;padding:10px 8px;vertical-align:top}th{color:#53627a} .scroll{overflow:auto}.badge{padding:3px 8px;border-radius:99px;background:#e5f1ff;color:#164f8d;font-size:12px}.warn{background:#fff4dc;color:#855900}.flash{padding:10px 13px;background:#e5f4e9;border-radius:8px;margin:8px 0}.danger{color:#a33333}.small{font-size:12px}@media(max-width:650px){main{margin:18px auto}th,td{padding:8px 6px}}
+:root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#37352f;background:#fff;font-synthesis:none;text-rendering:optimizeLegibility}*{box-sizing:border-box}body{margin:0}.sidebar{position:fixed;inset:0 auto 0 0;width:238px;padding:20px 12px;background:#f7f7f5;border-right:1px solid #eee;display:flex;flex-direction:column;z-index:2}.workspace{display:flex;align-items:center;gap:10px;padding:5px 10px 22px;font-weight:650;color:#292823;text-decoration:none}.logo{width:30px;height:30px;border-radius:8px;background:#e8e6df;display:grid;place-items:center}.side-label{font-size:11px;text-transform:uppercase;color:#9b9991;letter-spacing:.07em;margin:8px 10px}.nav{display:flex;gap:10px;align-items:center;color:#62615d;text-decoration:none;padding:8px 10px;border-radius:6px;font-size:14px}.nav:hover,.nav.active{background:#ecebe8;color:#25241f}.nav-icon{width:18px;text-align:center;color:#85837b}.side-bottom{margin-top:auto;padding:10px;font-size:12px;color:#8b8981}.topbar{height:48px;position:fixed;z-index:1;left:238px;right:0;top:0;background:#ffffffed;border-bottom:1px solid #efefed;display:flex;align-items:center;justify-content:space-between;padding:0 34px;color:#828078;font-size:13px}.topbar a{color:#66645d;text-decoration:none}.topbar a:hover{color:#111}.main{margin-left:238px;padding:84px 42px 70px;max-width:1460px}.page-head{margin:0 0 28px}.eyebrow{font-size:13px;color:#89877f;margin-bottom:9px}.page-head h1{font-size:32px;letter-spacing:-.035em;font-weight:650;margin:0 0 7px}.subtitle{color:#8b8981;font-size:14px}.section{margin:34px 0 0;scroll-margin-top:72px}.section-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px}.section-title h2{font-size:17px;font-weight:620;margin:0}.muted{color:#8b8981}.small{font-size:12px}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:22px 0 30px}.stat{border:1px solid #eae9e6;border-radius:8px;padding:16px 18px;background:#fff}.stat-label{font-size:12px;color:#8c8981}.metric{font-size:26px;font-weight:650;margin-top:5px;letter-spacing:-.03em}.notice{border:1px solid #f0dfb8;background:#fffaf0;border-radius:7px;padding:12px 14px;margin:8px 0;font-size:13px}.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:13px}.item-card,.loan-card,.panel{border:1px solid #e9e8e5;border-radius:8px;background:#fff;overflow:hidden}.item-photo{height:150px;background:#f4f4f1;display:grid;place-items:center;color:#b2b0a8;font-size:30px;overflow:hidden}.item-photo img{width:100%;height:100%;object-fit:cover}.item-content{padding:13px 14px}.item-code{font-size:11px;color:#a09e96;letter-spacing:.025em}.item-name{font-size:15px;font-weight:600;margin:5px 0 4px}.item-meta{font-size:12px;color:#89877f}.item-actions{display:flex;gap:13px;margin-top:12px;font-size:12px}.item-actions a,.text-link{color:#69675f;text-decoration:none}.item-actions a:hover,.text-link:hover{text-decoration:underline}.pill{display:inline-block;background:#f1f0ed;border-radius:4px;padding:3px 6px;font-size:11px;color:#6c6a62}.pill.warn{background:#fff1d6;color:#8b5d08}.loan-list{display:grid;gap:10px}.loan-card{padding:14px 16px;display:flex;justify-content:space-between;gap:20px;align-items:center}.loan-main{min-width:0}.loan-name{font-weight:600;font-size:14px}.loan-detail{color:#817f77;font-size:12px;margin-top:5px;line-height:1.55}.loan-actions{display:flex;align-items:center;gap:10px;flex-shrink:0}.button,button{display:inline-flex;align-items:center;justify-content:center;border:1px solid #e5e4e0;background:#fff;color:#44423d;padding:7px 11px;border-radius:6px;text-decoration:none;font:inherit;font-size:13px;cursor:pointer}.button:hover,button:hover{background:#f7f7f5}.button.primary,button.primary{background:#37352f;color:#fff;border-color:#37352f}.button.primary:hover,button.primary:hover{background:#55534c}.button.small-btn{padding:5px 8px;font-size:12px}.panel{padding:17px 18px;margin-top:13px}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 14px}label{display:block;font-size:12px;color:#74726a;margin:10px 0 5px}input,select,textarea{width:100%;border:1px solid #e4e3df;border-radius:6px;padding:9px 10px;font:inherit;font-size:13px;color:#37352f;background:#fff}input:focus,select:focus,textarea:focus{outline:2px solid #d8e5d8;border-color:#9caf99}textarea{min-height:74px;resize:vertical}.form-actions{margin-top:12px}.file-note{font-size:11px;color:#929087;margin-top:3px}.flash{border:1px solid #d6e8d5;background:#f2faf1;border-radius:6px;padding:10px 13px;margin:0 0 14px;font-size:13px}.empty{border:1px dashed #e4e3df;border-radius:8px;padding:25px;text-align:center;color:#96948b;font-size:13px}.loan-time{font-variant-numeric:tabular-nums}.slip{max-width:820px;margin:0 auto;border:1px solid #e7e6e2;padding:36px;border-radius:8px}.slip h1{font-size:25px}.slip-row{display:grid;grid-template-columns:170px 1fr;border-bottom:1px solid #efeeeb;padding:11px 0;font-size:14px}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:42px}.signature{border-top:1px solid #c9c7bf;padding-top:10px;text-align:center;min-height:90px;font-size:12px;color:#77756d}.slip-tools{display:flex;justify-content:space-between;margin-bottom:16px}.admin-tools{border-left:2px solid #e8e6df;padding-left:12px;margin-bottom:14px}.hide{display:none}@media(max-width:800px){.sidebar{position:static;width:auto;height:auto;padding:10px;display:flex;flex-direction:row;align-items:center;overflow:auto;border-right:0;border-bottom:1px solid #eee}.workspace{padding:4px 8px 4px 2px;white-space:nowrap}.side-label,.side-bottom{display:none}.nav{white-space:nowrap;padding:7px 8px}.topbar{position:static;height:40px;padding:0 15px}.main{margin-left:0;padding:24px 16px 45px}.page-head h1{font-size:27px}.stats{gap:8px}.stat{padding:12px}.metric{font-size:22px}.loan-card{align-items:flex-start;flex-direction:column;gap:12px}.loan-actions{width:100%;justify-content:flex-start}.slip{padding:22px 16px}}@media(max-width:520px){.form-grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.stat:last-child{grid-column:span 2}.card-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.item-photo{height:115px}.item-content{padding:10px}.item-name{font-size:13px}.slip-row{grid-template-columns:110px 1fr}.signatures{gap:14px}}
+@media print{.sidebar,.topbar,.slip-tools{display:none!important}.main{margin:0;padding:0;max-width:none}.slip{border:0;padding:0;max-width:none}}
 </style></head><body>
-<header><div><div class="brand">⚡ Phòng thí nghiệm Điện tử số</div>{% if user %}<div class="small">{{ user.full_name }} · {{ role_names[user.role] }}</div>{% endif %}</div>
-<nav>{% if user %}<a href="{{ url_for('index') }}">Tổng quan</a><a href="{{ url_for('reports') }}">Báo cáo CSV</a><a href="{{ url_for('logout') }}">Đăng xuất</a>{% endif %}</nav></header>
-<main>{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}{{ body|safe }}</main></body></html>"""
-
-ROLE_NAMES = {"admin": "Quản trị viên", "staff": "Cán bộ", "lecturer": "Giảng viên", "student": "Sinh viên"}
-
+<aside class="sidebar"><a class="workspace" href="{{ url_for('index') }}"><span class="logo">⚡</span><span>Điện tử số Lab</span></a><div class="side-label">Không gian làm việc</div>
+<a class="nav active" href="{{ url_for('index') }}"><span class="nav-icon">⌂</span>Tổng quan</a><a class="nav" href="{{ url_for('index') }}#inventory"><span class="nav-icon">▦</span>Kho thiết bị</a><a class="nav" href="{{ url_for('index') }}#loans"><span class="nav-icon">▤</span>Phiếu mượn</a><a class="nav" href="{{ url_for('reports') }}"><span class="nav-icon">↧</span>Báo cáo CSV</a>
+<div class="side-bottom">Phòng thí nghiệm Điện tử số<br>Trang xem công khai</div></aside>
+<div class="topbar"><span>Điện tử số Lab <span class="muted">/</span> {{ title }}</span>{% if user %}<span>{{ user.full_name }} · <a href="{{ url_for('logout') }}">Đăng xuất</a></span>{% else %}<a href="{{ url_for('login') }}">Admin</a>{% endif %}</div>
+<main class="main">{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}{{ body|safe }}</main></body></html>"""
 
 def connect_db():
     DATABASE.parent.mkdir(parents=True, exist_ok=True)
@@ -87,6 +94,12 @@ class ClosingConnection(sqlite3.Connection):
 def init_db():
     with connect_db() as db:
         db.executescript(SCHEMA)
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(items)")}
+        if "image_path" not in columns:
+            db.execute("ALTER TABLE items ADD COLUMN image_path TEXT NOT NULL DEFAULT ''")
+        loan_columns = {row["name"] for row in db.execute("PRAGMA table_info(loans)")}
+        if "borrower_name" not in loan_columns:
+            db.execute("ALTER TABLE loans ADD COLUMN borrower_name TEXT NOT NULL DEFAULT ''")
         username = os.environ.get("ADMIN_USERNAME")
         password = os.environ.get("ADMIN_PASSWORD")
         if username and password and not db.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
@@ -137,7 +150,7 @@ def csrf_guard():
 def shared_context():
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_urlsafe(32)
-    return {"user": current_user(), "csrf_token": session["csrf_token"], "role_names": ROLE_NAMES}
+    return {"user": current_user(), "csrf_token": session["csrf_token"]}
 
 
 def page(title, body, **context):
@@ -147,6 +160,8 @@ def page(title, body, **context):
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if current_user():
+        return redirect(url_for("index"))
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         with connect_db() as db:
@@ -157,79 +172,101 @@ def login():
             session["csrf_token"] = secrets.token_urlsafe(32)
             return redirect(url_for("index"))
         flash("Tên đăng nhập hoặc mật khẩu không đúng.")
-    body = """<section style="max-width:420px;margin:55px auto"><h1>Đăng nhập</h1><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Tên đăng nhập</label><input name="username" required autofocus><label>Mật khẩu</label><input type="password" name="password" required><button>Đăng nhập</button></form><p class="muted small">Tạo tài khoản quản trị bằng ADMIN_USERNAME và ADMIN_PASSWORD trước lần chạy đầu.</p></section>"""
+    body = """<div class="page-head"><div class="eyebrow">Khu vực quản trị</div><h1>Đăng nhập admin</h1><div class="subtitle">Khách có thể xem kho và phiếu mượn mà không cần tài khoản.</div></div><section class="panel" style="max-width:440px"><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Tên đăng nhập</label><input name="username" required autofocus><label>Mật khẩu</label><input type="password" name="password" required><div class="form-actions"><button class="primary">Đăng nhập</button></div></form><p class="muted small">Tài khoản admin được khởi tạo bằng ADMIN_USERNAME và ADMIN_PASSWORD.</p></section>"""
     return page("Đăng nhập", body)
 
 
 @app.get("/logout")
 def logout():
     session.clear()
-    return redirect(url_for("login"))
+    return redirect(url_for("index"))
 
 
 @app.get("/")
-@login_required
 def index():
     with connect_db() as db:
         items = db.execute("SELECT * FROM items ORDER BY name COLLATE NOCASE").fetchall()
-        loans = db.execute("""SELECT l.*, i.code, i.name AS item_name, u.full_name AS borrower_name,
-            issuer.full_name AS issuer_name FROM loans l JOIN items i ON i.id=l.item_id
-            JOIN users u ON u.id=l.borrower_id JOIN users issuer ON issuer.id=l.issued_by
-            WHERE l.returned_at IS NULL ORDER BY l.due_at""").fetchall()
-        users = db.execute("SELECT id, full_name, role FROM users WHERE active=1 ORDER BY full_name").fetchall()
+        loans = db.execute("""SELECT l.*, i.code, i.name AS item_name,
+            COALESCE(NULLIF(l.borrower_name,''),u.full_name) AS actual_borrower,
+            issuer.full_name AS issuer_name, receiver.full_name AS receiver_name
+            FROM loans l JOIN items i ON i.id=l.item_id JOIN users u ON u.id=l.borrower_id
+            JOIN users issuer ON issuer.id=l.issued_by LEFT JOIN users receiver ON receiver.id=l.received_by
+            ORDER BY CASE WHEN l.returned_at IS NULL THEN 0 ELSE 1 END, l.borrowed_at DESC LIMIT 100""").fetchall()
+    active_loans = [loan for loan in loans if not loan["returned_at"]]
     low = [item for item in items if item["quantity"] <= item["minimum_stock"]]
-    body = """<h1>Tổng quan</h1><div class="grid"><div class="card"><div class="muted">Mặt hàng</div><div class="metric">{{ items|length }}</div></div><div class="card"><div class="muted">Phiếu đang mượn</div><div class="metric">{{ loans|length }}</div></div><div class="card"><div class="muted">Sắp hết tồn</div><div class="metric">{{ low|length }}</div></div></div>
-    {% if low %}<section><h2>Cảnh báo tồn kho</h2>{% for item in low %}<p><span class="badge warn">{{ item.code }}</span> {{ item.name }} — còn {{ item.quantity }}, mức tối thiểu {{ item.minimum_stock }}</p>{% endfor %}</section>{% endif %}
-    <section><h2>Kho thiết bị, vật tư</h2>{% if user.role in ['admin','staff'] %}<details><summary class="button">Thêm mặt hàng</summary><form method="post" action="{{ url_for('add_item') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Mã thiết bị</label><input name="code" required></div><div><label>Tên mặt hàng</label><input name="name" required></div><div><label>Loại</label><input name="category" placeholder="Máy tính, kit, board..."></div><div><label>Vị trí</label><input name="location"></div><div><label>Số lượng</label><input type="number" min="0" name="quantity" value="1" required></div><div><label>Mức tồn tối thiểu</label><input type="number" min="0" name="minimum_stock" value="0"></div></div><label>Ghi chú</label><textarea name="notes"></textarea><button>Lưu mặt hàng</button></form></details>{% endif %}<div class="scroll"><table><thead><tr><th>Mã</th><th>Tên / Loại</th><th>Vị trí</th><th>Còn</th><th>QR</th></tr></thead><tbody>{% for item in items %}<tr><td>{{ item.code }}</td><td>{{ item.name }}<div class="muted small">{{ item.category }}{% if item.notes %} · {{ item.notes }}{% endif %}</div></td><td>{{ item.location }}</td><td>{{ item.quantity }}{% if item.quantity <= item.minimum_stock %} <span class="badge warn">Tồn thấp</span>{% endif %}</td><td><a href="{{ url_for('item_qr', item_id=item.id) }}">Tải QR</a></td></tr>{% else %}<tr><td colspan="5" class="muted">Chưa có mặt hàng. Hãy thêm mặt hàng để bắt đầu.</td></tr>{% endfor %}</tbody></table></div></section>
-    {% if user.role in ['admin','staff','lecturer'] %}<section><h2>Lập phiếu mượn</h2><form method="post" action="{{ url_for('add_loan') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Thiết bị</label><select name="item_id" required>{% for item in items if item.quantity > 0 %}<option value="{{ item.id }}">{{ item.code }} — {{ item.name }} ({{ item.quantity }})</option>{% endfor %}</select></div><div><label>Người mượn</label><select name="borrower_id" required>{% for person in users %}<option value="{{ person.id }}">{{ person.full_name }} ({{ role_names[person.role] }})</option>{% endfor %}</select></div><div><label>Số lượng</label><input type="number" name="quantity" min="1" value="1" required></div><div><label>Hạn trả</label><input type="date" name="due_at" min="{{ today }}" required></div><div><label>Người giao (ký tên)</label><input name="giver_signature" required></div><div><label>Người nhận (ký tên)</label><input name="receiver_signature" required></div></div><label>Mục đích sử dụng</label><textarea name="purpose" required></textarea><button>Tạo phiếu mượn</button></form></section>{% endif %}
-    <section><h2>Đang mượn</h2><div class="scroll"><table><thead><tr><th>Mã phiếu / thiết bị</th><th>Người mượn</th><th>Số lượng</th><th>Mục đích</th><th>Thời hạn / đã mượn</th><th>Ký nhận ban đầu</th><th></th></tr></thead><tbody>{% for loan in loans %}<tr><td>#{{ loan.id }}<div>{{ loan.code }} — {{ loan.item_name }}</div></td><td>{{ loan.borrower_name }}</td><td>{{ loan.quantity }}</td><td>{{ loan.purpose }}</td><td>{{ loan.due_at }}<div class="elapsed muted small" data-borrowed="{{ loan.borrowed_at }}">Đang tính…</div>{% if loan.due_at < today %}<span class="badge warn">Quá hạn</span>{% endif %}</td><td>{{ loan.giver_signature }} / {{ loan.receiver_signature }}</td><td>{% if user.role in ['admin','staff'] %}<form method="post" action="{{ url_for('return_loan', loan_id=loan.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>Người nhận trả</label><input name="return_signature" required><button>Ghi nhận trả</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="7" class="muted">Không có thiết bị đang mượn.</td></tr>{% endfor %}</tbody></table></div></section>
-    {% if user.role == 'admin' %}<section><h2>Tạo tài khoản</h2><form method="post" action="{{ url_for('add_user') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="grid"><div><label>Tên đăng nhập</label><input name="username" required></div><div><label>Họ tên</label><input name="full_name" required></div><div><label>Mật khẩu tạm</label><input type="password" name="password" minlength="10" required></div><div><label>Vai trò</label><select name="role">{% for role, name in role_names.items() %}<option value="{{ role }}">{{ name }}</option>{% endfor %}</select></div></div><button>Tạo tài khoản</button></form></section>{% endif %}
-    <script>document.querySelectorAll('.elapsed').forEach(function(el){const start=new Date(el.dataset.borrowed.replace(' ','T')+'Z');function tick(){let s=Math.max(0,Math.floor((Date.now()-start.getTime())/1000)),d=Math.floor(s/86400);s%=86400;let h=Math.floor(s/3600);s%=3600;let m=Math.floor(s/60);el.textContent='Đã mượn '+d+' ngày '+h+' giờ '+m+' phút'}tick();setInterval(tick,60000)})</script>"""
-    return page("Tổng quan", body, items=items, loans=loans, users=users, low=low,
+    body = """<div class="page-head"><div class="eyebrow">Không gian làm việc / Tổng quan</div><h1>Phòng thí nghiệm Điện tử số</h1><div class="subtitle">Thiết bị, vật tư và các phiếu bàn giao của phòng thí nghiệm.</div></div>
+    <div class="stats"><div class="stat"><div class="stat-label">Mặt hàng trong kho</div><div class="metric">{{ items|length }}</div></div><div class="stat"><div class="stat-label">Phiếu đang mượn</div><div class="metric">{{ active_loans|length }}</div></div><div class="stat"><div class="stat-label">Cảnh báo tồn thấp</div><div class="metric">{{ low|length }}</div></div></div>
+    {% if low %}<div class="section"><div class="section-title"><h2>⚠ Cần bổ sung</h2></div>{% for item in low %}<div class="notice"><strong>{{ item.code }}</strong> · {{ item.name }} — còn {{ item.quantity }}, mức tối thiểu {{ item.minimum_stock }}</div>{% endfor %}</div>{% endif %}
+    <section class="section" id="inventory"><div class="section-title"><h2>▦ Kho thiết bị</h2><span class="muted small">{{ items|length }} mặt hàng</span></div>
+    {% if user and user.role == 'admin' %}<details class="panel"><summary style="cursor:pointer;font-size:13px;font-weight:600">＋ Thêm mặt hàng hoặc cập nhật số liệu</summary><form method="post" enctype="multipart/form-data" action="{{ url_for('add_item') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid"><div><label>Mã thiết bị</label><input name="code" required></div><div><label>Tên mặt hàng</label><input name="name" required></div><div><label>Loại thiết bị</label><input name="category" placeholder="Máy tính, kit, board..."></div><div><label>Vị trí lưu kho</label><input name="location"></div><div><label>Số lượng hiện có</label><input type="number" min="0" name="quantity" value="1" required></div><div><label>Mức tồn tối thiểu</label><input type="number" min="0" name="minimum_stock" value="0"></div><div style="grid-column:1/-1"><label>Hình ảnh thiết bị</label><input type="file" name="image" accept="image/png,image/jpeg,image/webp,image/gif"><div class="file-note">PNG, JPG, WEBP hoặc GIF · tối đa 8 MB</div></div></div><label>Ghi chú</label><textarea name="notes"></textarea><div class="form-actions"><button class="primary">Lưu mặt hàng</button></div></form></details>{% endif %}
+    <div class="card-grid">{% for item in items %}<article class="item-card"><div class="item-photo">{% if item.image_path %}<img src="{{ url_for('uploaded_image', filename=item.image_path) }}" alt="Ảnh {{ item.name }}">{% else %}<span>▧</span>{% endif %}</div><div class="item-content"><div class="item-code">{{ item.code }}</div><div class="item-name">{{ item.name }}</div><div class="item-meta">{{ item.category }}{% if item.location %} · {{ item.location }}{% endif %}</div><div style="margin-top:9px"><span class="pill">Còn {{ item.quantity }}</span> {% if item.quantity <= item.minimum_stock %}<span class="pill warn">Tồn thấp</span>{% endif %}</div><div class="item-actions"><a href="{{ url_for('item_qr', item_id=item.id) }}">Mã QR ↗</a></div></div></article>{% else %}<div class="empty">Chưa có mặt hàng trong kho.</div>{% endfor %}</div></section>
+    <section class="section" id="loans"><div class="section-title"><h2>▤ Phiếu mượn và bàn giao</h2><span class="muted small">{{ loans|length }} phiếu gần đây</span></div>
+    {% if user and user.role == 'admin' %}<details class="panel"><summary style="cursor:pointer;font-size:13px;font-weight:600">＋ Lập phiếu mượn</summary><form method="post" action="{{ url_for('add_loan') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><div class="form-grid"><div><label>Thiết bị</label><select name="item_id" required>{% for item in items if item.quantity > 0 %}<option value="{{ item.id }}">{{ item.code }} — {{ item.name }} ({{ item.quantity }})</option>{% endfor %}</select></div><div><label>Họ tên người mượn</label><input name="borrower_name" required></div><div><label>Số lượng</label><input type="number" name="quantity" min="1" value="1" required></div><div><label>Hạn trả</label><input type="date" name="due_at" min="{{ today }}" required></div><div><label>Người giao ký tên</label><input name="giver_signature" required></div><div><label>Người nhận ký tên</label><input name="receiver_signature" required></div></div><label>Mục đích sử dụng</label><textarea name="purpose" required></textarea><div class="form-actions"><button class="primary">Tạo phiếu mượn</button></div></form></details>{% endif %}
+    <div class="loan-list">{% for loan in loans %}<article class="loan-card"><div class="loan-main"><div class="loan-name">{{ loan.code }} · {{ loan.item_name }} <span class="pill">#{{ loan.id }}</span></div><div class="loan-detail">Người mượn: {{ loan.actual_borrower }} · SL {{ loan.quantity }} · Hạn trả {{ loan.due_at }}<br>{{ loan.purpose }} · <span class="loan-time" data-borrowed="{{ loan.borrowed_at }}">Đang tính thời gian</span>{% if loan.due_at < today and not loan.returned_at %} · <span style="color:#9b6500">Quá hạn</span>{% endif %}</div></div><div class="loan-actions">{% if loan.returned_at %}<span class="pill">Đã trả</span>{% else %}<span class="pill warn">Đang mượn</span>{% endif %}<a class="button small-btn" href="{{ url_for('loan_slip', loan_id=loan.id) }}">Mở phiếu</a>{% if user and user.role == 'admin' and not loan.returned_at %}<form method="post" action="{{ url_for('return_loan', loan_id=loan.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input name="return_signature" placeholder="Người nhận trả ký tên" required><button class="small-btn">Ghi nhận trả</button></form>{% endif %}</div></article>{% else %}<div class="empty">Chưa có phiếu mượn.</div>{% endfor %}</div></section>
+    <script>document.querySelectorAll('.loan-time').forEach(function(el){const start=new Date(el.dataset.borrowed.replace(' ','T')+'Z');function tick(){let s=Math.max(0,Math.floor((Date.now()-start.getTime())/1000)),d=Math.floor(s/86400);s%=86400;let h=Math.floor(s/3600);s%=3600;let m=Math.floor(s/60);el.textContent='Đã mượn '+d+' ngày '+h+' giờ '+m+' phút'}tick();setInterval(tick,60000)})</script>"""
+    return page("Tổng quan", body, items=items, loans=loans, active_loans=active_loans, low=low,
                 today=date.today().isoformat())
 
 
 @app.post("/items")
-@roles_required("admin", "staff")
+@roles_required("admin")
 def add_item():
     code, name = request.form.get("code", "").strip(), request.form.get("name", "").strip()
+    image_path = ""
     try:
         quantity = int(request.form.get("quantity", "1"))
         minimum = int(request.form.get("minimum_stock", "0"))
         if not code or not name or quantity < 0 or minimum < 0:
             raise ValueError
+        upload = request.files.get("image")
+        if upload and upload.filename:
+            safe_name = secure_filename(upload.filename)
+            if not safe_name:
+                raise ValueError
+            upload.stream.seek(0)
+            with Image.open(upload.stream) as image:
+                image_format = image.format
+                if image_format not in ALLOWED_IMAGE_FORMATS or image.width * image.height > 20_000_000:
+                    raise ValueError
+                image.verify()
+            image_path = uuid.uuid4().hex + ALLOWED_IMAGE_FORMATS[image_format]
+            UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+            upload.stream.seek(0)
+            upload.save(UPLOADS_DIR / image_path)
         with connect_db() as db:
-            db.execute("INSERT INTO items(code,name,category,location,quantity,minimum_stock,notes) VALUES(?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO items(code,name,category,location,quantity,minimum_stock,notes,image_path) VALUES(?,?,?,?,?,?,?,?)",
                        (code, name, request.form.get("category", "Khác").strip() or "Khác",
                         request.form.get("location", "").strip(), quantity, minimum,
-                        request.form.get("notes", "").strip()))
+                        request.form.get("notes", "").strip(), image_path))
         flash("Đã thêm mặt hàng vào kho.")
-    except (ValueError, sqlite3.IntegrityError):
-        flash("Không thể thêm: hãy kiểm tra số lượng và mã thiết bị có bị trùng không.")
+    except (ValueError, OSError, sqlite3.IntegrityError, Image.DecompressionBombError):
+        if image_path:
+            (UPLOADS_DIR / image_path).unlink(missing_ok=True)
+        flash("Không thể thêm: kiểm tra số liệu, mã trùng hoặc định dạng ảnh.")
     return redirect(url_for("index"))
 
 
 @app.post("/loans")
-@roles_required("admin", "staff", "lecturer")
+@roles_required("admin")
 def add_loan():
     try:
-        item_id, borrower_id = int(request.form["item_id"]), int(request.form["borrower_id"])
+        item_id = int(request.form["item_id"])
         quantity = int(request.form["quantity"])
         due = date.fromisoformat(request.form["due_at"])
+        borrower_name = request.form.get("borrower_name", "").strip()
         purpose = request.form.get("purpose", "").strip()
         giver = request.form.get("giver_signature", "").strip()
         receiver = request.form.get("receiver_signature", "").strip()
-        if quantity < 1 or due < date.today() or not purpose or not giver or not receiver:
+        if quantity < 1 or due < date.today() or not borrower_name or not purpose or not giver or not receiver:
             raise ValueError
         with connect_db() as db:
             db.execute("BEGIN IMMEDIATE")
             item = db.execute("SELECT quantity FROM items WHERE id=?", (item_id,)).fetchone()
-            borrower = db.execute("SELECT id FROM users WHERE id=? AND active=1", (borrower_id,)).fetchone()
-            if not item or not borrower or item["quantity"] < quantity:
+            if not item or item["quantity"] < quantity:
                 raise ValueError
             db.execute("UPDATE items SET quantity=quantity-? WHERE id=?", (quantity, item_id))
-            db.execute("INSERT INTO loans(item_id,borrower_id,quantity,purpose,borrowed_at,due_at,issued_by,giver_signature,receiver_signature) VALUES(?,?,?,?,?,?,?,?,?)",
-                       (item_id, borrower_id, quantity, purpose, datetime.now().isoformat(timespec="seconds"),
+            db.execute("INSERT INTO loans(item_id,borrower_id,borrower_name,quantity,purpose,borrowed_at,due_at,issued_by,giver_signature,receiver_signature) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (item_id, current_user()["id"], borrower_name, quantity, purpose, datetime.now().isoformat(timespec="seconds"),
                         due.isoformat(), current_user()["id"], giver, receiver))
         flash("Đã tạo phiếu mượn và cập nhật tồn kho.")
     except (ValueError, KeyError, sqlite3.IntegrityError):
@@ -238,7 +275,7 @@ def add_loan():
 
 
 @app.post("/loans/<int:loan_id>/return")
-@roles_required("admin", "staff")
+@roles_required("admin")
 def return_loan(loan_id):
     signature = request.form.get("return_signature", "").strip()
     if not signature:
@@ -257,28 +294,7 @@ def return_loan(loan_id):
     return redirect(url_for("index"))
 
 
-@app.post("/users")
-@roles_required("admin")
-def add_user():
-    username = request.form.get("username", "").strip()
-    full_name = request.form.get("full_name", "").strip()
-    password = request.form.get("password", "")
-    role = request.form.get("role", "student")
-    if not username or not full_name or len(password) < 10 or role not in ROLE_NAMES:
-        flash("Kiểm tra thông tin; mật khẩu cần ít nhất 10 ký tự.")
-    else:
-        try:
-            with connect_db() as db:
-                db.execute("INSERT INTO users(username,full_name,password_hash,role) VALUES(?,?,?,?)",
-                           (username, full_name, generate_password_hash(password), role))
-            flash("Đã tạo tài khoản. Gửi thông tin đăng nhập cho người dùng qua kênh an toàn.")
-        except sqlite3.IntegrityError:
-            flash("Tên đăng nhập đã tồn tại.")
-    return redirect(url_for("index"))
-
-
 @app.get("/reports.csv")
-@login_required
 def reports():
     output = io.StringIO()
     writer = csv.writer(output)
@@ -289,7 +305,7 @@ def reports():
             JOIN users u ON u.id=l.borrower_id JOIN users issuer ON issuer.id=l.issued_by
             LEFT JOIN users receiver ON receiver.id=l.received_by ORDER BY l.id DESC""").fetchall()
     for row in rows:
-        writer.writerow([row["id"], row["code"], row["name"], row["borrower"], row["quantity"], row["purpose"], row["borrowed_at"], row["due_at"], row["issuer"] + ": " + row["giver_signature"], row["receiver_signature"], row["returned_at"] or "", row["receiver"] or "", row["return_signature"]])
+        writer.writerow([row["id"], row["code"], row["name"], row["borrower_name"] or row["borrower"], row["quantity"], row["purpose"], row["borrowed_at"], row["due_at"], row["issuer"] + ": " + row["giver_signature"], row["receiver_signature"], row["returned_at"] or "", row["receiver"] or "", row["return_signature"]])
     response = make_response("\ufeff" + output.getvalue())
     response.headers["Content-Type"] = "text/csv; charset=utf-8"
     response.headers["Content-Disposition"] = "attachment; filename=bao-cao-muon-tra.csv"
@@ -297,7 +313,6 @@ def reports():
 
 
 @app.get("/items/<int:item_id>/qr.png")
-@login_required
 def item_qr(item_id):
     with connect_db() as db:
         item = db.execute("SELECT code,name FROM items WHERE id=?", (item_id,)).fetchone()
@@ -308,6 +323,26 @@ def item_qr(item_id):
     image.save(file_obj, format="PNG")
     file_obj.seek(0)
     return send_file(file_obj, mimetype="image/png", download_name=f"QR-{item['code']}.png")
+
+
+@app.get("/uploads/<path:filename>")
+def uploaded_image(filename):
+    return send_from_directory(UPLOADS_DIR, filename)
+
+
+@app.get("/loans/<int:loan_id>/slip")
+def loan_slip(loan_id):
+    with connect_db() as db:
+        loan = db.execute("""SELECT l.*, i.code, i.name item_name,
+            COALESCE(NULLIF(l.borrower_name,''),u.full_name) actual_borrower,
+            issuer.full_name issuer_name, receiver.full_name receiver_name
+            FROM loans l JOIN items i ON i.id=l.item_id JOIN users u ON u.id=l.borrower_id
+            JOIN users issuer ON issuer.id=l.issued_by LEFT JOIN users receiver ON receiver.id=l.received_by
+            WHERE l.id=?""", (loan_id,)).fetchone()
+    if not loan:
+        abort(404)
+    body = """<div class="slip-tools"><a class="button" href="{{ url_for('index') }}#loans">← Quay lại danh sách</a><button class="primary" onclick="window.print()">In phiếu</button></div><article class="slip"><div class="eyebrow">PHÒNG THÍ NGHIỆM ĐIỆN TỬ SỐ</div><h1>PHIẾU MƯỢN THIẾT BỊ</h1><div class="subtitle">Mã phiếu #{{ loan.id }} · {{ 'Đã trả' if loan.returned_at else 'Đang mượn' }}</div><div style="margin-top:25px"><div class="slip-row"><strong>Thiết bị</strong><span>{{ loan.code }} — {{ loan.item_name }}</span></div><div class="slip-row"><strong>Người mượn</strong><span>{{ loan.actual_borrower }}</span></div><div class="slip-row"><strong>Số lượng</strong><span>{{ loan.quantity }}</span></div><div class="slip-row"><strong>Mục đích</strong><span>{{ loan.purpose }}</span></div><div class="slip-row"><strong>Ngày mượn</strong><span>{{ loan.borrowed_at }}</span></div><div class="slip-row"><strong>Hạn trả</strong><span>{{ loan.due_at }}</span></div>{% if loan.returned_at %}<div class="slip-row"><strong>Ngày trả</strong><span>{{ loan.returned_at }}</span></div><div class="slip-row"><strong>Người nhận trả</strong><span>{{ loan.receiver_name or '' }}</span></div>{% endif %}</div><div class="signatures"><div class="signature">Người giao<br><strong>{{ loan.giver_signature }}</strong></div><div class="signature">Người nhận<br><strong>{{ loan.receiver_signature }}</strong></div>{% if loan.returned_at %}<div class="signature">Người nhận trả<br><strong>{{ loan.return_signature }}</strong></div>{% endif %}</div></article>"""
+    return page(f"Phiếu mượn #{loan_id}", body, loan=loan)
 
 
 @app.errorhandler(403)
