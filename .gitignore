@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.vercel/
 .env
 instance/
 *.sqlite3
